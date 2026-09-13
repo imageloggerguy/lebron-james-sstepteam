@@ -1,0 +1,861 @@
+-- /mnt/user-data/outputs/endtiers_part1.lua
+-- Endtiers v3.7 — Part 1 (core logic, no GUI)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+local player = Players.LocalPlayer
+
+local THEME = {
+    Background = Color3.fromRGB(18, 18, 20),
+    Panel = Color3.fromRGB(24, 24, 27),
+    Sidebar = Color3.fromRGB(22, 22, 24),
+    SidebarActive = Color3.fromRGB(38, 38, 42),
+    Topbar = Color3.fromRGB(20, 20, 22),
+    ElementBg = Color3.fromRGB(32, 32, 36),
+    Accent = Color3.fromRGB(0, 162, 255),
+    AccentGreen = Color3.fromRGB(60, 200, 110),
+    TextMain = Color3.fromRGB(240, 240, 240),
+    TextDim = Color3.fromRGB(140, 140, 145),
+    Border = Color3.fromRGB(45, 45, 50),
+    TrackBg = Color3.fromRGB(45, 45, 50),
+}
+
+local STATE = {
+    AE_Enabled = false, AE_RequireShift = true, AE_ShowIndicator = false,
+    AE_BoostValue = 55, AE_AngleThreshold = 25, AE_CooldownWindow = 2.5,
+    AE_MinTimeBetweenTriggers = 0.2,
+    JP_Enabled = false, JP_HeadScale = 1.015, JP_BoostVelocity = 27,
+    JP_DetectionRange = 4, JP_BoostCooldown = 2.7,
+    JP_AffectNPCs = true, JP_AffectPlayers = true,
+    JP_HitboxX = 1.0, JP_HitboxY = 1.0, JP_HitboxZ = 1.0,
+    FPS_Enabled = false, FPS_Value = 27,
+}
+
+local activeTab = "ae"
+local shiftHeld = false
+local lastShiftRelease = 0
+local SHIFT_TAP_WINDOW = 0.6
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift then
+        shiftHeld = true
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.LeftShift or input.KeyCode == Enum.KeyCode.RightShift then
+        shiftHeld = false
+        lastShiftRelease = tick()
+    end
+end)
+
+local aeLastTick = 0
+local aeOldLookVector = nil
+
+task.spawn(function()
+    while true do
+        task.wait()
+        if not STATE.AE_Enabled then aeOldLookVector = nil continue end
+        local character = player.Character
+        if not character then aeOldLookVector = nil continue end
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        local hrp = character:FindFirstChild("HumanoidRootPart")
+        if not humanoid or not hrp then aeOldLookVector = nil continue end
+        if humanoid:GetState() ~= Enum.HumanoidStateType.Jumping then aeOldLookVector = nil continue end
+        local currentTime = tick()
+        local newLookVector = hrp.CFrame.LookVector
+        if not aeOldLookVector then aeOldLookVector = newLookVector aeLastTick = currentTime continue end
+        local angleChange = math.acos(math.clamp(aeOldLookVector:Dot(newLookVector), -1, 1))
+        if STATE.AE_RequireShift then
+            if currentTime - lastShiftRelease > SHIFT_TAP_WINDOW then
+                if angleChange > math.rad(5) then aeOldLookVector = newLookVector end
+                continue
+            end
+        end
+        if currentTime - aeLastTick >= STATE.AE_MinTimeBetweenTriggers and angleChange > math.rad(5) then
+            aeLastTick = currentTime
+            aeOldLookVector = newLookVector
+        end
+        if angleChange > math.rad(STATE.AE_AngleThreshold) and currentTime - aeLastTick <= STATE.AE_CooldownWindow then
+            aeLastTick = currentTime
+            aeOldLookVector = newLookVector
+            task.wait()
+            local vel = hrp.AssemblyLinearVelocity
+            hrp.AssemblyLinearVelocity = Vector3.new(vel.X, STATE.AE_BoostValue, vel.Z)
+            if STATE.AE_ShowIndicator then
+                local hint = Instance.new("Hint")
+                hint.Text = "Angled!"
+                hint.Parent = workspace.Terrain
+                task.delay(2.5, function()
+                    if hint and hint.Parent then hint:Destroy() end
+                end)
+            end
+        end
+    end
+end)
+
+local jpLastBoost = 0
+local jpIsDiving = false
+local jpScaledCharacters = {}
+local jpGhostBoxes = {}
+
+local function jpCheckDivingState()
+    local char = player.Character
+    if not char then return false end
+    local humanoid = char:FindFirstChild("Humanoid")
+    if not humanoid then return false end
+    local state = humanoid:GetState()
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if state == Enum.HumanoidStateType.Freefall and root then
+        local vel = root.Velocity
+        if vel.Y < -20 and vel.Magnitude > 25 then return true end
+    end
+    local animator = humanoid:FindFirstChild("Animator")
+    if animator then
+        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+            local n = track.Animation.Name:lower()
+            if n:find("dive") or n:find("tackle") or n:find("slide") or n:find("fall") then return true end
+        end
+    end
+    return char:GetAttribute("Diving") == true or char:GetAttribute("IsDiving") == true
+end
+
+RunService.Heartbeat:Connect(function() jpIsDiving = jpCheckDivingState() end)
+
+local function jpComputeBoxSize(headSize)
+    local hs = headSize or Vector3.new(2, 1, 1)
+    local scale = STATE.JP_HeadScale
+    return Vector3.new(
+        hs.X * math.max(0.01, scale * STATE.JP_HitboxX),
+        hs.Y * math.max(0.01, scale * STATE.JP_HitboxY),
+        hs.Z * math.max(0.01, scale * STATE.JP_HitboxZ)
+    )
+end
+
+local function jpRescaleAll()
+    for model, box in pairs(jpGhostBoxes) do
+        if box and box.Parent and model and model.Parent then
+            local head = model:FindFirstChild("Head")
+            if head then box.Size = jpComputeBoxSize(head.Size) end
+        end
+    end
+end
+
+local function jpInstallGhost(model)
+    if not model or jpScaledCharacters[model] or model == player.Character then return end
+    local head = model:FindFirstChild("Head")
+    if not head or not head:IsA("BasePart") then return end
+    local box = Instance.new("Part")
+    box.Name = "EndtiersGhostHitbox"
+    box.Size = jpComputeBoxSize(head.Size)
+    box.Transparency = 1
+    box.CanCollide = true
+    box.Massless = true
+    box.Anchored = false
+    box.CanTouch = false
+    box.CanQuery = false
+    box.CastShadow = false
+    box.Parent = model
+    local weld = Instance.new("WeldConstraint")
+    weld.Part0 = head
+    weld.Part1 = box
+    weld.Parent = box
+    box.CFrame = head.CFrame
+    jpGhostBoxes[model] = box
+    jpScaledCharacters[model] = true
+    head:GetPropertyChangedSignal("Size"):Connect(function()
+        if box and box.Parent then
+            box.Size = jpComputeBoxSize(head.Size)
+            box.CFrame = head.CFrame
+        end
+    end)
+end
+
+for _, other in ipairs(Players:GetPlayers()) do
+    if other.Character then jpInstallGhost(other.Character) end
+    other.CharacterAdded:Connect(function(char)
+        char:WaitForChild("Head", 5)
+        jpInstallGhost(char)
+    end)
+end
+Players.PlayerAdded:Connect(function(other)
+    other.CharacterAdded:Connect(function(char)
+        char:WaitForChild("Head", 5)
+        jpInstallGhost(char)
+    end)
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(5)
+        if not STATE.JP_Enabled then continue end
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("Model") then
+                local h = obj:FindFirstChildOfClass("Humanoid")
+                local hd = obj:FindFirstChild("Head")
+                if h and hd and not Players:GetPlayerFromCharacter(obj) then
+                    jpInstallGhost(obj)
+                end
+            end
+        end
+    end
+end)
+
+workspace.DescendantAdded:Connect(function(obj)
+    if not STATE.JP_Enabled or not obj:IsA("Model") then return end
+    task.wait(0.5)
+    local h = obj:FindFirstChildOfClass("Humanoid")
+    local hd = obj:FindFirstChild("Head")
+    if h and hd and not Players:GetPlayerFromCharacter(obj) then jpInstallGhost(obj) end
+end)
+
+RunService.Heartbeat:Connect(function()
+    if not STATE.JP_Enabled or jpIsDiving then return end
+    local myChar = player.Character
+    if not myChar then return end
+    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+    local myHumanoid = myChar:FindFirstChild("Humanoid")
+    if not myRoot or not myHumanoid then return end
+    if myHumanoid.FloorMaterial ~= Enum.Material.Air then return end
+    local now = tick()
+    if now - jpLastBoost < STATE.JP_BoostCooldown then return end
+
+    if STATE.JP_AffectPlayers then
+        for _, other in ipairs(Players:GetPlayers()) do
+            if other == player then continue end
+            local oc = other.Character
+            if not oc then continue end
+            local box = oc:FindFirstChild("EndtiersGhostHitbox")
+            local oh = oc:FindFirstChild("Humanoid")
+            if not box or not oh then continue end
+            local myPos, boxPos = myRoot.Position, box.Position
+            local dist = (Vector3.new(myPos.X, boxPos.Y, myPos.Z) - boxPos).Magnitude
+            if dist < STATE.JP_DetectionRange and myPos.Y > boxPos.Y and myRoot.Velocity.Y < 0 then
+                if oh.FloorMaterial == Enum.Material.Air and box.Velocity.Y > 0 then
+                    myRoot.Velocity = Vector3.new(myRoot.Velocity.X, STATE.JP_BoostVelocity, myRoot.Velocity.Z)
+                    jpLastBoost = now
+                    return
+                end
+            end
+        end
+    end
+
+    if STATE.JP_AffectNPCs then
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if not obj:IsA("Model") or obj == myChar or Players:GetPlayerFromCharacter(obj) then continue end
+            local box = obj:FindFirstChild("EndtiersGhostHitbox")
+            local nh = obj:FindFirstChildOfClass("Humanoid")
+            if not box or not nh then continue end
+            local myPos, boxPos = myRoot.Position, box.Position
+            local dist = (Vector3.new(myPos.X, boxPos.Y, myPos.Z) - boxPos).Magnitude
+            if dist < STATE.JP_DetectionRange and myPos.Y > boxPos.Y and myRoot.Velocity.Y < 0 then
+                if nh.FloorMaterial == Enum.Material.Air and box.Velocity.Y > 0 then
+                    myRoot.Velocity = Vector3.new(myRoot.Velocity.X, STATE.JP_BoostVelocity, myRoot.Velocity.Z)
+                    jpLastBoost = now
+                    return
+                end
+            end
+        end
+    end
+end)
+
+local function applyFPS()
+    if not STATE.FPS_Enabled then return end
+    if setfpscap then pcall(function() setfpscap(STATE.FPS_Value) end) end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if STATE.FPS_Enabled then applyFPS() end
+    end
+end)
+
+-- ===== WRITE STATE TO A SHARED GLOBAL FOR PART 2 =====
+_G.ENDTIERS_THEME = THEME
+_G.ENDTIERS_STATE = STATE
+_G.ENDTIERS_APPLYFPS = applyFPS
+_G.ENDTIERS_JP_RESCALE = jpRescaleAll
+_G.ENDTIERS_SET_TAB = function(tab) activeTab = tab end
+
+print("[endtiers] part 1 loaded")-- /mnt/user-data/outputs/endtiers_part2.lua
+-- Endtiers v3.7 — Part 2 (GUI + sidebar + all controls)
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local THEME = _G.ENDTIERS_THEME
+local STATE = _G.ENDTIERS_STATE
+local applyFPS = _G.ENDTIERS_APPLYFPS
+local jpRescaleAll = _G.ENDTIERS_JP_RESCALE
+
+if not THEME or not STATE then
+    warn("Run endtiers_part1.lua first")
+    return
+end
+
+local activeTab = "ae"
+
+local function makeDraggable(f, handle)
+    local dragging = false
+    local dragStart, startPos, dragConn, endConn
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = f.Position
+            if dragConn then dragConn:Disconnect() end
+            if endConn then endConn:Disconnect() end
+            dragConn = UserInputService.InputChanged:Connect(function(m)
+                if not dragging then return end
+                if m.UserInputType == Enum.UserInputType.MouseMovement or m.UserInputType == Enum.UserInputType.Touch then
+                    local delta = m.Position - dragStart
+                    f.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+                end
+            end)
+            endConn = UserInputService.InputEnded:Connect(function(e)
+                if e.UserInputType == Enum.UserInputType.MouseButton1 or e.UserInputType == Enum.UserInputType.Touch then
+                    dragging = false
+                    if dragConn then dragConn:Disconnect() dragConn = nil end
+                    if endConn then endConn:Disconnect() endConn = nil end
+                end
+            end)
+        end
+    end)
+end
+
+local function makeSlider(parent, labelText, min, max, default, suffix, callback)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 60)
+    container.BackgroundColor3 = THEME.ElementBg
+    container.BorderSizePixel = 0
+    container.Parent = parent
+    Instance.new("UICorner", container).CornerRadius = UDim.new(0, 8)
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.6, -20, 0, 20)
+    label.Position = UDim2.new(0, 16, 0, 8)
+    label.BackgroundTransparency = 1
+    label.Text = labelText
+    label.TextColor3 = THEME.TextMain
+    label.TextSize = 14
+    label.Font = Enum.Font.GothamMedium
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = container
+
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.Size = UDim2.new(0.4, -20, 0, 20)
+    valueLabel.Position = UDim2.new(0.6, 10, 0, 8)
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Text = string.format("%.2f%s", default, suffix or "")
+    valueLabel.TextColor3 = THEME.Accent
+    valueLabel.TextSize = 14
+    valueLabel.Font = Enum.Font.GothamBold
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valueLabel.Parent = container
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(1, -32, 0, 6)
+    bar.Position = UDim2.new(0, 16, 0, 40)
+    bar.BackgroundColor3 = THEME.TrackBg
+    bar.BorderSizePixel = 0
+    bar.Parent = container
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(1, 0)
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((default - min) / (max - min), 0, 1, 0)
+    fill.BackgroundColor3 = THEME.Accent
+    fill.BorderSizePixel = 0
+    fill.Parent = bar
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+    local thumb = Instance.new("Frame")
+    thumb.Size = UDim2.new(0, 16, 0, 16)
+    thumb.AnchorPoint = Vector2.new(0.5, 0.5)
+    thumb.Position = UDim2.new((default - min) / (max - min), 0, 0.5, 0)
+    thumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    thumb.BorderSizePixel = 0
+    thumb.Parent = bar
+    Instance.new("UICorner", thumb).CornerRadius = UDim.new(1, 0)
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundTransparency = 1
+    btn.Text = ""
+    btn.Parent = bar
+
+    local dragging = false
+    local dragConn, endConn
+    local function update(input)
+        local relX = math.clamp((input.Position.X - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+        local value = min + (max - min) * relX
+        fill.Size = UDim2.new(relX, 0, 1, 0)
+        thumb.Position = UDim2.new(relX, 0, 0.5, 0)
+        valueLabel.Text = string.format("%.2f%s", value, suffix or "")
+        callback(value)
+    end
+
+    btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            update(input)
+            if dragConn then dragConn:Disconnect() end
+            if endConn then endConn:Disconnect() end
+            dragConn = UserInputService.InputChanged:Connect(function(m)
+                if not dragging then return end
+                if m.UserInputType == Enum.UserInputType.MouseMovement or m.UserInputType == Enum.UserInputType.Touch then
+                    update(m)
+                end
+            end)
+            endConn = UserInputService.InputEnded:Connect(function(e)
+                if e.UserInputType == Enum.UserInputType.MouseButton1 or e.UserInputType == Enum.UserInputType.Touch then
+                    dragging = false
+                    if dragConn then dragConn:Disconnect() dragConn = nil end
+                    if endConn then endConn:Disconnect() endConn = nil end
+                end
+            end)
+        end
+    end)
+    return container
+end
+
+local function makeToggle(parent, labelText, default, callback)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 48)
+    container.BackgroundColor3 = THEME.ElementBg
+    container.BorderSizePixel = 0
+    container.Parent = parent
+    Instance.new("UICorner", container).CornerRadius = UDim.new(0, 8)
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.7, -20, 1, 0)
+    label.Position = UDim2.new(0, 16, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = labelText
+    label.TextColor3 = THEME.TextMain
+    label.TextSize = 14
+    label.Font = Enum.Font.GothamMedium
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = container
+
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(0, 50, 0, 26)
+    track.Position = UDim2.new(1, -66, 0.5, -13)
+    track.BackgroundColor3 = default and THEME.AccentGreen or THEME.TrackBg
+    track.BorderSizePixel = 0
+    track.Parent = container
+    Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 20, 0, 20)
+    knob.Position = default and UDim2.new(1, -22, 0, 3) or UDim2.new(0, 2, 0, 3)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.BorderSizePixel = 0
+    knob.Parent = track
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundTransparency = 1
+    btn.Text = ""
+    btn.Parent = container
+
+    local state = default
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        track.BackgroundColor3 = state and THEME.AccentGreen or THEME.TrackBg
+        knob.Position = state and UDim2.new(1, -22, 0, 3) or UDim2.new(0, 2, 0, 3)
+        callback(state)
+    end)
+    return container
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "Endtiers"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = CoreGui
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 820, 0, 540)
+main.Position = UDim2.new(0.5, -410, 0.5, -270)
+main.BackgroundColor3 = THEME.Background
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = THEME.Border
+stroke.Thickness = 1
+stroke.Parent = main
+
+-- Top bar
+local topBar = Instance.new("Frame")
+topBar.Size = UDim2.new(1, 0, 0, 42)
+topBar.BackgroundColor3 = THEME.Topbar
+topBar.BorderSizePixel = 0
+topBar.Parent = main
+Instance.new("UICorner", topBar).CornerRadius = UDim.new(0, 10)
+
+local strip = Instance.new("Frame")
+strip.Size = UDim2.new(1, 0, 0, 10)
+strip.Position = UDim2.new(0, 0, 1, -10)
+strip.BackgroundColor3 = THEME.Topbar
+strip.BorderSizePixel = 0
+strip.Parent = topBar
+
+local logo = Instance.new("Frame")
+logo.Size = UDim2.new(0, 28, 0, 28)
+logo.Position = UDim2.new(0, 14, 0.5, -14)
+logo.BackgroundColor3 = THEME.Accent
+logo.BorderSizePixel = 0
+logo.Parent = topBar
+Instance.new("UICorner", logo).CornerRadius = UDim.new(0, 6)
+
+local logoText = Instance.new("TextLabel")
+logoText.Size = UDim2.new(1, 0, 1, 0)
+logoText.BackgroundTransparency = 1
+logoText.Text = "E"
+logoText.TextColor3 = Color3.fromRGB(255, 255, 255)
+logoText.TextSize = 16
+logoText.Font = Enum.Font.GothamBold
+logoText.Parent = logo
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(0, 300, 0, 20)
+title.Position = UDim2.new(0, 52, 0, 5)
+title.BackgroundTransparency = 1
+title.Text = "Endtiers v3.7"
+title.TextColor3 = THEME.TextMain
+title.TextSize = 14
+title.Font = Enum.Font.GothamBold
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = topBar
+
+local subtitle = Instance.new("TextLabel")
+subtitle.Size = UDim2.new(0, 300, 0, 14)
+subtitle.Position = UDim2.new(0, 52, 0, 22)
+subtitle.BackgroundTransparency = 1
+subtitle.Text = "by zais"
+subtitle.TextColor3 = THEME.TextDim
+subtitle.TextSize = 11
+subtitle.Font = Enum.Font.Gotham
+subtitle.TextXAlignment = Enum.TextXAlignment.Left
+subtitle.Parent = topBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 30, 0, 30)
+closeBtn.Position = UDim2.new(1, -40, 0.5, -15)
+closeBtn.BackgroundTransparency = 1
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = THEME.TextDim
+closeBtn.TextSize = 16
+closeBtn.Font = Enum.Font.Gotham
+closeBtn.Parent = topBar
+closeBtn.MouseButton1Click:Connect(function() main.Visible = false end)
+
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Size = UDim2.new(0, 30, 0, 30)
+minimizeBtn.Position = UDim2.new(1, -75, 0.5, -15)
+minimizeBtn.BackgroundTransparency = 1
+minimizeBtn.Text = "—"
+minimizeBtn.TextColor3 = THEME.TextDim
+minimizeBtn.TextSize = 16
+minimizeBtn.Font = Enum.Font.Gotham
+minimizeBtn.Parent = topBar
+
+local maximizeBtn = Instance.new("TextButton")
+maximizeBtn.Size = UDim2.new(0, 30, 0, 30)
+maximizeBtn.Position = UDim2.new(1, -110, 0.5, -15)
+maximizeBtn.BackgroundTransparency = 1
+maximizeBtn.Text = "▢"
+maximizeBtn.TextColor3 = THEME.TextDim
+maximizeBtn.TextSize = 14
+maximizeBtn.Font = Enum.Font.Gotham
+maximizeBtn.Parent = topBar
+
+makeDraggable(main, topBar)
+
+-- Sidebar
+local sidebar = Instance.new("Frame")
+sidebar.Size = UDim2.new(0, 200, 1, -54)
+sidebar.Position = UDim2.new(0, 12, 0, 50)
+sidebar.BackgroundColor3 = THEME.Sidebar
+sidebar.BorderSizePixel = 0
+sidebar.Parent = main
+Instance.new("UICorner", sidebar).CornerRadius = UDim.new(0, 8)
+
+local sl = Instance.new("UIListLayout")
+sl.Padding = UDim.new(0, 2)
+sl.SortOrder = Enum.SortOrder.LayoutOrder
+sl.Parent = sidebar
+
+local sp = Instance.new("UIPadding")
+sp.PaddingTop = UDim.new(0, 10)
+sp.PaddingLeft = UDim.new(0, 8)
+sp.PaddingRight = UDim.new(0, 8)
+sp.Parent = sidebar
+
+-- Content
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -236, 1, -66)
+content.Position = UDim2.new(0, 224, 0, 50)
+content.BackgroundColor3 = THEME.Panel
+content.BorderSizePixel = 0
+content.Parent = main
+Instance.new("UICorner", content).CornerRadius = UDim.new(0, 8)
+
+local cp = Instance.new("UIPadding")
+cp.PaddingTop = UDim.new(0, 20)
+cp.PaddingLeft = UDim.new(0, 24)
+cp.PaddingRight = UDim.new(0, 24)
+cp.PaddingBottom = UDim.new(0, 20)
+cp.Parent = content
+
+local contentTitle = Instance.new("TextLabel")
+contentTitle.Size = UDim2.new(1, 0, 0, 26)
+contentTitle.BackgroundTransparency = 1
+contentTitle.Text = "Angle Enhancer"
+contentTitle.TextColor3 = THEME.TextMain
+contentTitle.TextSize = 20
+contentTitle.Font = Enum.Font.GothamBold
+contentTitle.TextXAlignment = Enum.TextXAlignment.Left
+contentTitle.Parent = content
+
+local contentSubtitle = Instance.new("TextLabel")
+contentSubtitle.Size = UDim2.new(1, 0, 0, 18)
+contentSubtitle.Position = UDim2.new(0, 0, 0, 26)
+contentSubtitle.BackgroundTransparency = 1
+contentSubtitle.Text = "Shift-gated angle boost"
+contentSubtitle.TextColor3 = THEME.TextDim
+contentSubtitle.TextSize = 12
+contentSubtitle.Font = Enum.Font.Gotham
+contentSubtitle.TextXAlignment = Enum.TextXAlignment.Left
+contentSubtitle.Parent = content
+
+local function makePage()
+    local p = Instance.new("ScrollingFrame")
+    p.Size = UDim2.new(1, 0, 1, -56)
+    p.Position = UDim2.new(0, 0, 0, 56)
+    p.BackgroundTransparency = 1
+    p.BorderSizePixel = 0
+    p.ScrollBarThickness = 4
+    p.ScrollBarImageColor3 = THEME.Border
+    p.CanvasSize = UDim2.new(0, 0, 0, 0)
+    p.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    p.Visible = false
+    p.Parent = content
+    local l = Instance.new("UIListLayout")
+    l.Padding = UDim.new(0, 8)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.Parent = p
+    return p
+end
+
+local aePage = makePage()
+local jpPage = makePage()
+local fpsPage = makePage()
+aePage.Visible = true
+
+local sidebarItems = {}
+
+local function makeSidebarItem(name, displayName, callback)
+    local item = Instance.new("TextButton")
+    item.Size = UDim2.new(1, 0, 0, 42)
+    item.BackgroundColor3 = THEME.Sidebar
+    item.BorderSizePixel = 0
+    item.Text = ""
+    item.AutoButtonColor = false
+    item.Parent = sidebar
+    Instance.new("UICorner", item).CornerRadius = UDim.new(0, 6)
+
+    local icon = Instance.new("Frame")
+    icon.Size = UDim2.new(0, 18, 0, 18)
+    icon.Position = UDim2.new(0, 12, 0.5, -9)
+    icon.BackgroundColor3 = THEME.TextDim
+    icon.BorderSizePixel = 0
+    icon.Parent = item
+    Instance.new("UICorner", icon).CornerRadius = UDim.new(0, 4)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -42, 1, 0)
+    lbl.Position = UDim2.new(0, 38, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = displayName
+    lbl.TextColor3 = THEME.TextDim
+    lbl.TextSize = 13
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = item
+
+    item.MouseEnter:Connect(function()
+        if activeTab ~= name then item.BackgroundColor3 = THEME.ElementBg end
+    end)
+    item.MouseLeave:Connect(function()
+        if activeTab ~= name then item.BackgroundColor3 = THEME.Sidebar end
+    end)
+    item.MouseButton1Click:Connect(callback)
+
+    sidebarItems[name] = { item = item, icon = icon, lbl = lbl }
+end
+
+local function setActive(tab)
+    activeTab = tab
+    aePage.Visible = (tab == "ae")
+    jpPage.Visible = (tab == "jp")
+    fpsPage.Visible = (tab == "fps")
+
+    if tab == "ae" then
+        contentTitle.Text = "Angle Enhancer"
+        contentSubtitle.Text = "Shift-gated angle boost"
+    elseif tab == "jp" then
+        contentTitle.Text = "JP — Ghost Hitbox"
+        contentSubtitle.Text = "Invisible head hitbox, visible heads"
+    else
+        contentTitle.Text = "FPS Cap"
+        contentSubtitle.Text = "Frame rate limiter"
+    end
+
+       for n, data in pairs(sidebarItems) do
+        if n == tab then
+            data.item.BackgroundColor3 = THEME.SidebarActive
+            data.icon.BackgroundColor3 = THEME.Accent
+            data.lbl.TextColor3 = THEME.TextMain
+        else
+            data.item.BackgroundColor3 = THEME.Sidebar
+            data.icon.BackgroundColor3 = THEME.TextDim
+            data.lbl.TextColor3 = THEME.TextDim
+        end
+    end
+end
+
+makeSidebarItem("ae", "Angle Enhancer", function() setActive("ae") end)
+makeSidebarItem("jp", "JP Hitbox", function() setActive("jp") end)
+makeSidebarItem("fps", "FPS Cap", function() setActive("fps") end)
+
+-- AE PAGE
+makeToggle(aePage, "Require Shift Tap", STATE.AE_RequireShift, function(v)
+    STATE.AE_RequireShift = v
+end)
+
+makeSlider(aePage, "Boost Value", 50, 70, STATE.AE_BoostValue, "", function(v)
+    STATE.AE_BoostValue = v
+end)
+
+makeSlider(aePage, "Angle Threshold", 5, 60, STATE.AE_AngleThreshold, "°", function(v)
+    STATE.AE_AngleThreshold = v
+end)
+
+makeSlider(aePage, "Cooldown Window", 0.5, 5, STATE.AE_CooldownWindow, "s", function(v)
+    STATE.AE_CooldownWindow = v
+end)
+
+makeToggle(aePage, "Show 'Angled!' Hint", STATE.AE_ShowIndicator, function(v)
+    STATE.AE_ShowIndicator = v
+end)
+
+-- JP PAGE
+makeSlider(jpPage, "Head Scale", 1.0, 3.0, STATE.JP_HeadScale, "x", function(v)
+    STATE.JP_HeadScale = v
+    if jpRescaleAll then jpRescaleAll() end
+end)
+
+makeSlider(jpPage, "Hitbox X (width)", -4.0, 4.0, STATE.JP_HitboxX, "x", function(v)
+    STATE.JP_HitboxX = v
+    if jpRescaleAll then jpRescaleAll() end
+end)
+
+makeSlider(jpPage, "Hitbox Y (height)", -4.0, 4.0, STATE.JP_HitboxY, "x", function(v)
+    STATE.JP_HitboxY = v
+    if jpRescaleAll then jpRescaleAll() end
+end)
+
+makeSlider(jpPage, "Hitbox Z (depth)", -4.0, 4.0, STATE.JP_HitboxZ, "x", function(v)
+    STATE.JP_HitboxZ = v
+    if jpRescaleAll then jpRescaleAll() end
+end)
+
+makeSlider(jpPage, "Boost Velocity", 10, 100, STATE.JP_BoostVelocity, "", function(v)
+    STATE.JP_BoostVelocity = v
+end)
+
+makeSlider(jpPage, "Detection Range", 1, 15, STATE.JP_DetectionRange, "", function(v)
+    STATE.JP_DetectionRange = v
+end)
+
+makeSlider(jpPage, "Boost Cooldown", 0.5, 5, STATE.JP_BoostCooldown, "s", function(v)
+    STATE.JP_BoostCooldown = v
+end)
+
+makeToggle(jpPage, "Affect Players", STATE.JP_AffectPlayers, function(v)
+    STATE.JP_AffectPlayers = v
+end)
+
+makeToggle(jpPage, "Affect NPCs / Bots", STATE.JP_AffectNPCs, function(v)
+    STATE.JP_AffectNPCs = v
+end)
+
+-- FPS PAGE
+makeSlider(fpsPage, "FPS Cap", 10, 240, STATE.FPS_Value, "", function(v)
+    STATE.FPS_Value = math.floor(v)
+    if STATE.FPS_Enabled and applyFPS then applyFPS() end
+end)
+
+-- MASTER TOGGLE (in topbar, before window controls)
+local masterBtn = Instance.new("TextButton")
+masterBtn.Size = UDim2.new(0, 60, 0, 22)
+masterBtn.Position = UDim2.new(1, -150, 0.5, -11)
+masterBtn.BackgroundColor3 = THEME.TrackBg
+masterBtn.BorderSizePixel = 0
+masterBtn.Text = "OFF"
+masterBtn.TextColor3 = THEME.TextMain
+masterBtn.TextSize = 10
+masterBtn.Font = Enum.Font.GothamBold
+masterBtn.Parent = topBar
+Instance.new("UICorner", masterBtn).CornerRadius = UDim.new(0, 6)
+
+local function refreshMaster()
+    local on
+    if activeTab == "ae" then on = STATE.AE_Enabled
+    elseif activeTab == "jp" then on = STATE.JP_Enabled
+    else on = STATE.FPS_Enabled end
+    masterBtn.BackgroundColor3 = on and THEME.AccentGreen or THEME.TrackBg
+    masterBtn.Text = on and "ON" or "OFF"
+end
+
+masterBtn.MouseButton1Click:Connect(function()
+    if activeTab == "ae" then
+        STATE.AE_Enabled = not STATE.AE_Enabled
+    elseif activeTab == "jp" then
+        STATE.JP_Enabled = not STATE.JP_Enabled
+    else
+        STATE.FPS_Enabled = not STATE.FPS_Enabled
+        if STATE.FPS_Enabled and applyFPS then applyFPS()
+        else if setfpscap then pcall(function() setfpscap(0) end) end end
+    end
+    refreshMaster()
+end)
+
+-- Hook tab switching to refresh master
+local origSetActive = setActive
+setActive = function(tab)
+    origSetActive(tab)
+    refreshMaster()
+end
+
+-- RightAlt hide GUI
+UserInputService.InputBegan:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.RightAlt then
+        main.Visible = not main.Visible
+    end
+end)
+
+-- Init
+setActive("ae")
+refreshMaster()
+
+print("[endtiers] v3.7 loaded")
